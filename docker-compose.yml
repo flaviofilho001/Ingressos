@@ -1,0 +1,161 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. BANCO DE DADOS POSTGRESQL 16 (DATABASE-PER-SERVICE)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ingressos-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ingressos_user
+      POSTGRES_PASSWORD: ingressos_password
+      POSTGRES_DB: ingressos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-schemas.sql:/docker-entrypoint-initdb.d/init-schemas.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingressos_user -d ingressos_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. CACHE E DISTRIBUTED LOCKS (REDIS 7)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ingressos-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 3. MESSAGE BROKER (RABBITMQ 3.13)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ingressos-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Dashboard Web de Gerenciamento
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 4. MICROSSERVICO 1: CATALOGO E RESERVAS (.NET 10)
+  # ---------------------------------------------------------------------------
+  reservation-service:
+    build:
+      context: .
+      dockerfile: services/ReservationService/Dockerfile
+    container_name: ingressos-reservation-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=reservation_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5001:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 5. MICROSSERVICO 2: PEDIDOS E ORQUESTRADOR SAGA (.NET 10)
+  # ---------------------------------------------------------------------------
+  order-saga-service:
+    build:
+      context: .
+      dockerfile: services/OrderSagaService/Dockerfile
+    container_name: ingressos-order-saga-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=orders_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5002:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 6. MICROSSERVICO 3: PAGAMENTO SIMULADO (.NET 10)
+  # ---------------------------------------------------------------------------
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/PaymentService/Dockerfile
+    container_name: ingressos-payment-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=payments_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5003:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 7. FRONTEND SPA (REACT + VITE + TAILWIND)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ingressos-frontend
+    restart: always
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_RESERVATION_API_URL=http://localhost:5001/api
+      - VITE_ORDER_API_URL=http://localhost:5002/api
+      - VITE_PAYMENT_API_URL=http://localhost:5003/api
+    depends_on:
+      - reservation-service
+      - order-saga-service
+      - payment-service
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitdata:

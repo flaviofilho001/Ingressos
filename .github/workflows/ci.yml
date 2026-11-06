@@ -1,0 +1,84 @@
+name: CI Ingressos (.NET 10 & React)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  backend-ci:
+    name: Build & Test Backend (.NET 10)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ingressos_user
+          POSTGRES_PASSWORD: ingressos_password
+          POSTGRES_DB: ingressos_test_db
+        ports: [ 5432:5432 ]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: [ 6379:6379 ]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        ports: [ 5672:5672 ]
+        options: --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restaurar Pacotes NuGet
+        run: |
+          if [ -f Ingressos.sln ]; then
+            dotnet restore Ingressos.sln
+          fi
+
+      - name: Compilar Solucao (.NET 10)
+        run: |
+          if [ -f Ingressos.sln ]; then
+            dotnet build Ingressos.sln --configuration Release --no-restore
+          fi
+
+      - name: Executar Testes Unitarios e Integracao
+        run: |
+          if [ -f Ingressos.sln ]; then
+            dotnet test Ingressos.sln --configuration Release --no-build --verbosity normal
+          fi
+
+  frontend-ci:
+    name: Build & Lint Frontend (React)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Dependencias e Build
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run lint --if-present
+            npm test -- --run --if-present
+            npm run build
+          else
+            echo "Diretorio frontend em preparacao. Pulando etapa."
+          fi

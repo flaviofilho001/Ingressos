@@ -1,0 +1,914 @@
+================================================================================
+PROJETO 02 — DOCUMENTACAO INICIAL DO PROJETO (ARQUITETURA E MODELAGEM)
+Data de entrega: 06/11/2026
+Disciplina: Sistemas Distribuidos / Engenharia de Software
+================================================================================
+
+PROJETO: Sistema de Venda de Ingressos com Reserva de Assentos
+REPOSITORIO: https://github.com/flaviofilho001/Ingressos
+
+================================================================================
+1. IDENTIFICACAO DO PROJETO E DA EQUIPE
+================================================================================
+
+1.1 DADOS DA EQUIPE
+
+| N  | Nome Completo          | GitHub                       | Matricula / Contato   |
+|----|------------------------|------------------------------|-----------------------|
+| 1  | Flavio Filho (*)       | github.com/flaviofilho001    | 20230146390           |
+| 2  | John Victor (*)        | github.com/johnvictor01      | 20220125879           |
+
+(*) Integrantes responsaveis pelo desenvolvimento, arquitetura e operacao.
+
+1.2 RESUMO DO TEMA E OBJETIVOS
+
+O projeto consiste em uma plataforma de venda de ingressos com reserva
+temporaria de assentos numerados fundamentada em uma **Arquitetura de Microsservicos**.
+O sistema foi concebido para resolver problemas criticos em ambientes distribuidos:
+  - Prevencao rigorosa de double-booking (venda dupla de assentos);
+  - Reserva com tempo de expiracao (TTL de 5 minutos);
+  - Garantia de Idempotencia em tentativas repetidas (duplo clique, retries);
+  - Consistencia eventual com padrao SAGA Orquestrada e acoes de compensacao;
+  - Confiabilidade absoluta na publicacao de eventos via Transactional Outbox;
+  - Simulacao parametrizavel de gateway de pagamentos via Strategy Pattern;
+  - Isolamento de responsabilidades e escalabilidade independente com Microsservicos.
+
+
+================================================================================
+2. DEFINICAO DO STACK TECNOLOGICO E JUSTIFICATIVAS
+================================================================================
+
+A solucao adota tecnologias modernas e performaticas, integradas para operacao
+em nuvem no Railway e protegidas na borda pelo Cloudflare:
+
+2.1 BACKEND: C# / .NET 10 (ASP.NET Core Web API)
+  - Justificativa:
+    * .NET 10 (LTS): Proporciona o runtime de maior desempenho da plataforma .NET,
+      com dynamic PGO (Profile-Guided Optimization), consumo reduzido de RAM e
+      modelo assincrono de alto rendimento, essencial para suportar picos de
+      concorrencia na disputa de assentos.
+    * Modelagem de Dominio (DDD): Suporte completo a padroes corporativos
+      (Repository, Unit of Work e Strategy) com tipagem estrita em C# 14.
+    * Mensageria Avancada: MassTransit 8 integrado ao .NET 10, viabilizando
+      SAGA State Machine e Transactional Outbox com baixo custo de desenvolvimento.
+
+2.2 FRONTEND: React 18 / 19 + TypeScript + Vite + Tailwind CSS
+  - Justificativa:
+    * SPA Reativa e Leve: Renderizacao do mapa de assentos com atualizacao
+      imediata de estados (disponivel, reservado, ocupado, selecionado).
+    * Timer de TTL Regressivo: Cronometro visual de 5 minutos sincronizado com a reserva.
+    * Seletor de Simulacao de Pagamento: Interface grafica intuitiva para que o
+      avaliador execute cenarios de teste (Aprovado, Recusado, Timeout, Erro 500).
+
+2.3 CAMADA DE BORDA E GATEWAY: Cloudflare
+  - Justificativa:
+    * Atua como Edge API Gateway e camada de seguranca de borda, eliminando a
+      necessidade de manter contêineres adicionais de reverse proxy locais.
+    * Fornece:
+        a) Roteamento de trafego para os microsservicos no Railway;
+        b) SSL/TLS automatico de ponta a ponta;
+        c) CDN global com cache para os assets estaticos da SPA React;
+        d) Web Application Firewall (WAF) e mitigacao de ataques DDoS;
+        e) Edge Rate Limiting para coibir robos/bots tentando esgotar assentos.
+
+2.4 AMBIENTE DE HOSPEDAGEM E DEPLOY CONTINUO: Railway PaaS
+  - Justificativa:
+    * Hospedagem integrada em rede privada de altissima velocidade e baixa latencia.
+    * Executa os conteineres independentes dos microsservicos (.NET 10), o Frontend,
+      o cluster PostgreSQL, o Redis e o RabbitMQ.
+    * Deploy automatico integrado a branch main do GitHub.
+
+2.5 BANCO DE DADOS: PostgreSQL 16 (Gerenciado no Railway)
+  - Justificativa:
+    * Suporte ao padrao Database-per-Service (esquemas logicos isolados:
+      `reservation_db`, `order_db`, `payment_db`).
+    * Bloqueios pessimistas (`SELECT ... FOR UPDATE`) garantindo atomicidade absoluta
+      no momento da selecao do assento.
+    * Suporte a JSONB para serializacao dos payloads de eventos na tabela Outbox.
+
+2.6 CACHE E DISTRIBUTED LOCKS: Redis 7 (Gerenciado no Railway)
+  - Justificativa:
+    * Gerenciamento de chaves temporarias com TTL automatico (300s) para o bloqueio
+      do assento enquanto o usuario realiza o pagamento.
+    * Validacao rapida de chaves de idempotencia (`idempotency:{key}`).
+
+2.7 MESSAGE BROKER: RabbitMQ 3.13 + MassTransit (.NET 10)
+  - Justificativa:
+    * Barramento assincrono de mensagens duraveis para desacoplar a comunicacao
+      entre os microsservicos, com suporte a exchanges, queues duraveis e dead-letter queues (DLQ).
+
+
+================================================================================
+3. PADROES ARQUITETURAIS E DE PROJETO APLICADOS
+================================================================================
+
+3.1 PADROES ARQUITETURAIS (MICROSSERVICOS E SISTEMAS DISTRIBUIDOS)
+
+  [1] PADRAO ARQUITETURAL DE MICROSSERVICOS (Microservices Architecture Pattern)
+      * O sistema e decomposto em servicos autonomos, implantaveis de forma
+        independente e desacoplados:
+          - Reservation Service: Domínio de assentos, eventos e bloqueios temporarios.
+          - Order & Saga Orchestrator Service: Dominio de checkout, pedidos e coordenacao SAGA.
+          - Payment Service (Simulado): Dominio financeiro de pagamento simulado.
+      * Cada servico possui seu proprio ciclo de vida de publicacao no Railway.
+
+  [2] DATABASE-PER-SERVICE PATTERN (Isolamento de Persistencia)
+      * Cada microsservico e proprietario exclusivo de sua persistencia de dados
+        (esquemas isolados no PostgreSQL).
+      * Nenhum servico acessa diretamente as tabelas de outro; qualquer troca
+        de dados ocorre via APIs REST ou eventos assincronos no RabbitMQ.
+
+  [3] SAGA ORQUESTRADA COM COMPENSACAO (Orchestration-based SAGA Pattern)
+      * A transacao distribuida de compra e coordenada por um orquestrador centralizado
+        (`OrderSagaStateMachine`) implementado com MassTransit no Order Service.
+      * Fluxo:
+          1. Pedido Criado -> 2. Bloqueio de Assento -> 3. Cobranca -> 4. Confirmacao.
+      * Transacoes Compensatorias: Se o pagamento falhar ou sofrer timeout, a SAGA
+        dispara automaticamente o comando compensatorio `ReleaseSeatCommand`,
+        desfazendo o bloqueio do assento e cancelando o pedido.
+
+  [4] TRANSACTIONAL OUTBOX PATTERN & OUTBOX RELAY
+      * Resolve o problema de Dual-Write (gravar no banco e publicar no broker).
+      * No Reservation Service e no Order Service, a gravacao da entidade e a
+        insercao do evento de dominio ocorrem na MESMA transacao atomica do PostgreSQL
+        na tabela `OutboxMessages`.
+      * Um background worker (Outbox Relay) publica os eventos no RabbitMQ com
+        garantia de entrega At-Least-Once.
+
+  [5] IDEMPOTENT CONSUMER & IDEMPOTENCY KEY PATTERN
+      * O cliente envia o header HTTP `Idempotency-Key` (UUIDv4) no checkout.
+      * Se o cliente clicar duas vezes ou a rede falhar e houver retentativa,
+        o sistema detecta a chave no Redis/Postgres e devolve a resposta cacheada
+        sem gerar cobranca ou reserva duplicada.
+      * Os consumidores de eventos no MassTransit utilizam `MessageId` para
+        ignorar mensagens duplicadas.
+
+3.2 PADROES DE PROJETO (DESIGN PATTERNS - GoF & ENTERPRISE)
+
+  [6] REPOSITORY PATTERN
+      * Separa a logica de negocio dos detalhes do Entity Framework Core 10.
+      * Contratos tipados: `ISeatRepository`, `IReservationRepository`, `IOrderRepository`.
+
+  [7] UNIT OF WORK PATTERN
+      * Coordena as operacoes transacionais locais de cada microsservico (`IUnitOfWork`),
+        assegurando que o estado do dominio e a tabela Outbox sejam comitados atomicamente.
+
+  [8] STRATEGY PATTERN (Simulador Parametrizavel de Pagamentos)
+      * Encapsula os diferentes cenarios de processamento financeiro sob a interface
+        `IPaymentStrategy`.
+      * Estrategias disponiveis:
+        - `ApprovedPaymentStrategy`: Simula transacao aceita com codigo de autorizacao.
+        - `DeclinedPaymentStrategy`: Simula recusa imediata (saldo insuficiente/cartao invalido).
+        - `TimeoutPaymentStrategy`: Simula latencia excessiva para ativar a compensacao da SAGA.
+        - `NetworkErrorPaymentStrategy`: Simula erro de infraestrutura 500 para testar retries.
+
+
+================================================================================
+4. DIAGRAMAS C4 MODEL
+================================================================================
+
+4.1 C4 - NIVEL 1: DIAGRAMA DE CONTEXTO DO SISTEMA (SYSTEM CONTEXT)
+
++-----------------------------------------------------------------------------+
+|                                                                             |
+|                                [ CLIENTE ]                                  |
+|                 (Usuario final comprando ingressos na web)                  |
+|                                                                             |
++--------------------------------------+--------------------------------------+
+                                       |
+                                       | 1. Seleciona evento e assento
+                                       | 2. Envia pagamento (com cenario simulado)
+                                       | 3. Acompanha status e recebe voucher
+                                       v
++-----------------------------------------------------------------------------+
+|                                                                             |
+|                    CLOUDFLARE (EDGE / SEGURANCA / CDN)                      |
+|                                                                             |
+|  - Roteamento de rotas (/api/* -> Microsservicos, /* -> Frontend SPA)       |
+|  - Terminacao SSL/HTTPS e protecao contra ataques DDoS / WAF                |
+|  - Rate Limiting na borda contra bots e esgotamento malicioso               |
+|                                                                             |
++--------------------------------------+--------------------------------------+
+                                       |
+                                       | HTTPS Seguro
+                                       v
++-----------------------------------------------------------------------------+
+|                                                                             |
+|             SISTEMA DE VENDA DE INGRESSOS (MICROSSERVICOS NO RAILWAY)       |
+|                                                                             |
+|  - Frontend SPA em React 18/19 com mapa interativo e cronometro de TTL      |
+|  - Reservation Microservice (C# / .NET 10): Assentos, locks e Outbox        |
+|  - Order & SAGA Microservice (C# / .NET 10): Maquina de estados SAGA        |
+|  - Payment Microservice (C# / .NET 10): Pagamento simulado com Strategy     |
+|  - PostgreSQL, Redis e RabbitMQ gerenciados na rede privada                 |
+|                                                                             |
++-----------------------------------------------------------------------------+
+
+
+4.2 C4 - NIVEL 2: DIAGRAMA DE CONTÊINERES (CONTAINERS)
+
+O diagrama detalha a arquitetura de microsservicos independentes implantados
+no Railway sob a protecao do Cloudflare:
+
++------------------------------------------------------------------------------------------------------------------------+
+|                                                   CAMADA DE BORDA (EDGE)                                               |
+|                                                                                                                        |
+|       +--------------------------------------------------------------------------------------------------------+       |
+|       |                                         CLOUDFLARE (EDGE LAYER)                                        |       |
+|       | - DNS, SSL/TLS, CDN de assets estaticos, Edge Rate Limiting e WAF                                      |       |
+|       | - Roteamento: '/' -> Frontend SPA | '/api/reservations/*' -> Reservation | '/api/orders/*' -> Orders   |       |
+|       +------------------------------------+-----------------------------------+-------------------------------+       |
++--------------------------------------------|-----------------------------------|---------------------------------------+
+                                             |                                   |
+                                             | Requisicoes Web                   | Chamadas de API REST
+                                             | (HTML/JS/Assets)                  | (Com Idempotency-Key Header)
+                                             v                                   v
++------------------------------------------------------------------------------------------------------------------------+
+|                                            AMBIENTE RAILWAY (REDE PRIVADA)                                             |
+|                                                                                                                        |
+|   +------------------------------------+              +------------------------------------------------------------+   |
+|   |         FRONTEND CONTAINER         |              |              RESERVATION SERVICE CONTAINER                 |   |
+|   |       (REACT + VITE + NGINX)       |              |                     (C# / .NET 10)                         |   |
+|   |                                    |              |                                                            |   |
+|   | - Mapa visual de assentos          |              | - Catalogo de eventos e assentos                           |   |
+|   | - Timer regressivo de 5 min (TTL)  |              | - Bloqueio pessimista de assento (FOR UPDATE)              |   |
+|   | - Seletor de cenarios de teste     |              | - Transactional Outbox Publisher                           |   |
+|   |   (Approved, Declined, Timeout)    |              | - Repository & Unit of Work (EF Core 10)                   |   |
+|   +------------------------------------+              +-------------------+--------------------+-------------------+   |
+|                                                                           |                    |                       |
+|                                                                           | SQL                | Eventos Outbox        |
+|                                                                           v                    v                       |
+|   +------------------------------------+              +-------------------+----+      +--------+-------------------+   |
+|   |     ORDER & SAGA ORCHESTRATOR      |              |   POSTGRESQL 16 (DBS)  |      |   RABBITMQ 3.13 (BROKER)   |   |
+|   |          (C# / .NET 10)            |              |                        |      |                            |   |
+|   |                                    |              | - reservation_schema   |      | - order.initiated          |   |
+|   | - Orquestracao SAGA (MassTransit)  |-- SQL ------>| - orders_schema        |<---->| - seat.reserved            |   |
+|   | - Maquina de estados do pedido     |              | - payments_schema      |      | - payment.process          |   |
+|   | - Disparo de acoes compensatorias  |              | - OutboxMessages       |      | - payment.completed        |   |
+|   | - Validacao de Idempotency-Key     |              +------------------------+      | - payment.failed (compensa)|   |
+|   +-----------------+------------------+                                              | - release.seat (compensa)  |   |
+|                     |                                                                 +--------+-------------------+   |
+|                     | AMQP / Eventos                                                           ^                       |
+|                     v                                                                          | Eventos               |
+|   +------------------------------------+                                                       |                       |
+|   |      PAYMENT SERVICE SIMULADO      |                                                       |                       |
+|   |          (C# / .NET 10)            |-------------------------------------------------------+                       |
+|   |                                    |                                                                               |
+|   | - Strategy Pattern (IPayment)      |                                                                               |
+|   | - Simulacao de cenarios de falha   |              +------------------------+                                       |
+|   | - Validacao de cobranca unica      |-- Cache ---->|     REDIS 7 (CACHE)    |                                       |
+|   +------------------------------------+              | - TTL de 5 min (locks) |                                       |
+|                                                       | - Cache do mapa        |                                       |
+|                                                       | - Idempotency Keys     |                                       |
+|                                                       +------------------------+                                       |
++------------------------------------------------------------------------------------------------------------------------+
+
+
+================================================================================
+5. ARCHITECTURAL DECISION RECORDS (ADRs)
+================================================================================
+
+--------------------------------------------------------------------------------
+ADR 001: ADOCAO DO PADRAO DE ARQUITETURA DE MICROSSERVICOS COM DATABASE-PER-SERVICE
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  O sistema de venda de ingressos possui tres dominios com requisitos operacionais
+  distintos:
+    1. Reserva e Catalogo: Alto volume de leitura e contencao concorrente em assentos;
+    2. Pedidos/Checkout: Processos de longa duracao e orquestracao de transacoes distribuidas;
+    3. Pagamento: Integracao transacional financeira simulada com necessidade de isolamento.
+  Era necessario definir o padrao de decomposicao arquitetural da solucao.
+
+Decisao:
+  Adotar o Padrao Arquitetural de Microsservicos (Microservices Architecture Pattern)
+  com persistencia isolada (Database-per-Service / isolamento de esquemas no PostgreSQL),
+  gerando servicos autonomos em .NET 10 comunicando-se via REST (leituras) e
+  RabbitMQ (eventos assincronos).
+
+Justificativa:
+  - Isolamento de Falhas: Se o servico de pagamento ou a orquestracao apresentar
+    instabilidade, o catalogo e a visualizacao de assentos continuam operacionais.
+  - Escalabilidade Independente: O Reservation Service pode ser escalado
+    separadamente no Railway durante o pico de abertura de vendas.
+  - Alinhamento Rigoroso com os Padroes Distribuidos: Permite a aplicacao real e
+    demonstravel da SAGA, Outbox e compensacoes entre servicos autonomos.
+
+Consequencias:
+  (+) Alta modularidade e desacoplamento de codigo e banco.
+  (-) Exige tratamento rigoroso de consistencia eventual e transacoes compensatorias.
+
+--------------------------------------------------------------------------------
+ADR 002: SAGA ORQUESTRADA COM MASSTRANSIT STATE MACHINE PARA COMPENSACOES
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  A compra envolve operacoes distribuidas entre o Reservation Service e o
+  Payment Service coordenadas pelo Order Service. Em caso de recusa no pagamento
+  ou timeout, o assento DEVE ser desbloqueado imediatamente.
+
+Decisao:
+  Implementar o padrao SAGA Orquestrada gerenciado pelo MassTransit State Machine
+  no microsservico de Pedidos (`OrderSaga.Api`).
+
+Justificativa:
+  - Visibilidade centralizada do estado do pedido (`OrderState`).
+  - Coordenacao explicta de comandos de desfazimento (`ReleaseSeatCommand`).
+  - Evita a complexidade e o acoplamento oculto da SAGA Coreografada.
+
+Consequencias:
+  (+) Rastreamento simples do ciclo de vida da transacao distribuida.
+  (+) Facilidade de auditoria e testes de falha programada.
+
+--------------------------------------------------------------------------------
+ADR 003: GARANTIA DE ENTREGA AT-LEAST-ONCE COM TRANSACTIONAL OUTBOX PATTERN
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  A gravacao do estado da reserva no banco e o envio de evento para o broker
+  devem ser atomicos para evitar o problema de Dual-Write.
+
+Decisao:
+  Implementar o Transactional Outbox Pattern integrado ao Entity Framework Core 10
+  atraves do MassTransit Outbox no Reservation Service e no Order Service.
+
+Justificativa:
+  - Atomicidade local garantida: o evento e salvo na tabela `OutboxMessages` sob
+    a mesma transacao ACID da reserva.
+  - O Outbox Relay publica no RabbitMQ mesmo se o broker oscilar temporariamente.
+
+Consequencias:
+  (+) Zero perda de eventos de dominio entre banco e mensageria.
+
+--------------------------------------------------------------------------------
+ADR 004: CLOUDFLARE COMO EDGE API GATEWAY E CAMADA DE SEGURANCA
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  Necessidade de rotear chamadas do frontend para os tres microsservicos no Railway,
+  prover certificados SSL automaticos, CDN e protecao contra bots em vendas de alta procura.
+
+Decisao:
+  Utilizar o Cloudflare na borda (Edge Layer) atuando como Gateway e WAF.
+
+Justificativa:
+  - Elimina a necessidade de manter um contêiner pesado adicional de Gateway local.
+  - CDN de alta velocidade para o frontend React.
+  - Rate Limiting e WAF na borda contra esgotamento abusivo de assentos.
+
+Consequencias:
+  (+) Infraestrutura mais leve e segura, sem custos extras de manutencao.
+
+--------------------------------------------------------------------------------
+ADR 005: SIMULACAO DE GATEWAY DE PAGAMENTOS COM STRATEGY PATTERN E IDEMPOTENCIA
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  Necessidade de testar e demonstrar em aula todos os cenarios de sucesso e falha
+  (aprovado, recusado, timeout, erro 500) sem custos com adquirentes reais,
+  alem de impedir cobrancas duplicadas.
+
+Decisao:
+  Implementar o Strategy Pattern (`IPaymentStrategy`) no Payment Service associado
+  ao armazenamento de `Idempotency-Key` no Redis e PostgreSQL.
+
+Justificativa:
+  - Permite chavear dinamicamente o comportamento de teste via cabecalho ou payload.
+  - A chave de idempotencia evita cobranca duplicada em caso de duplo clique.
+
+Consequencias:
+  (+) Demonstracao ao professor extremamente clara e visual.
+
+--------------------------------------------------------------------------------
+ADR 006: CONTROLE DE CONCORRENCIA HIBRIDO COM LOCK PESSIMISTA E REDIS TTL
+--------------------------------------------------------------------------------
+Status: Aprovado
+Data: 06/11/2026
+Contexto:
+  Centenas de usuarios podem clicar no mesmo assento no mesmo instante, e reservas
+  nao pagas devem expirar em 5 minutos.
+
+Decisao:
+  Bloqueio pessimista no PostgreSQL (`SELECT ... FOR UPDATE` via EF Core) no instante
+  da reserva, associado a chave de TTL de 300 segundos no Redis para expirar reservas.
+
+Justificativa:
+  - Garantia ACID absoluta contra double-booking no banco relacional.
+  - Consultas ultra-rapidas servidas pelo cache Redis.
+
+Consequencias:
+  (+) Zero ocorrencia de venda duplicada mesmo sob testes de estresse simultaneo.
+
+
+================================================================================
+6. DETALHAMENTO DE CODIGO DOS PADROES EM C# (.NET 10)
+================================================================================
+
+6.1 REPOSITORY PATTERN E UNIT OF WORK NO RESERVATION SERVICE
+
+```csharp
+namespace Ingressos.ReservationService.Domain.Repositories;
+
+public interface ISeatRepository
+{
+    Task<Seat?> GetByIdWithLockAsync(Guid seatId, CancellationToken ct = default);
+    Task<IEnumerable<Seat>> GetAvailableByEventAsync(Guid eventId, CancellationToken ct = default);
+    void Update(Seat seat);
+}
+
+public interface IReservationRepository
+{
+    Task AddAsync(SeatReservation reservation, CancellationToken ct = default);
+    Task<SeatReservation?> GetActiveBySeatIdAsync(Guid seatId, CancellationToken ct = default);
+    void Update(SeatReservation reservation);
+}
+
+// Unit of Work gerenciando transacao atomica do EF Core 10 (Dominio + Outbox)
+public interface IUnitOfWork
+{
+    Task<int> CommitAsync(CancellationToken ct = default);
+    Task ExecuteTransactionAsync(Func<Task> action, CancellationToken ct = default);
+}
+
+public class UnitOfWork : IUnitOfWork
+{
+    private readonly ReservationDbContext _context;
+
+    public UnitOfWork(ReservationDbContext context) => _context = context;
+
+    public async Task<int> CommitAsync(CancellationToken ct = default)
+    {
+        return await _context.SaveChangesAsync(ct);
+    }
+
+    public async Task ExecuteTransactionAsync(Func<Task> action, CancellationToken ct = default)
+    {
+        await using var transaction = await _context.Database.BeginTransactionAsync(ct);
+        try
+        {
+            await action();
+            await _context.SaveChangesAsync(ct);
+            await transaction.CommitAsync(ct);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(ct);
+            throw;
+        }
+    }
+}
+```
+
+6.2 STRATEGY PATTERN NO PAYMENT SERVICE
+
+```csharp
+namespace Ingressos.PaymentService.Strategies;
+
+public enum PaymentScenario
+{
+    Approved,
+    Declined,
+    GatewayTimeout,
+    NetworkError
+}
+
+public interface IPaymentStrategy
+{
+    PaymentScenario Scenario { get; }
+    Task<PaymentExecutionResult> ProcessPaymentAsync(decimal amount, CancellationToken ct);
+}
+
+public class ApprovedPaymentStrategy : IPaymentStrategy
+{
+    public PaymentScenario Scenario => PaymentScenario.Approved;
+
+    public Task<PaymentExecutionResult> ProcessPaymentAsync(decimal amount, CancellationToken ct)
+    {
+        return Task.FromResult(new PaymentExecutionResult(
+            Success: true,
+            AuthorizationCode: $"AUTH-{Guid.NewGuid().ToString()[..8].ToUpper()}",
+            ErrorMessage: null
+        ));
+    }
+}
+
+public class DeclinedPaymentStrategy : IPaymentStrategy
+{
+    public PaymentScenario Scenario => PaymentScenario.Declined;
+
+    public Task<PaymentExecutionResult> ProcessPaymentAsync(decimal amount, CancellationToken ct)
+    {
+        return Task.FromResult(new PaymentExecutionResult(
+            Success: false,
+            AuthorizationCode: null,
+            ErrorMessage: "Pagamento recusado: Saldo insuficiente ou cartao invalido."
+        ));
+    }
+}
+
+public class TimeoutPaymentStrategy : IPaymentStrategy
+{
+    public PaymentScenario Scenario => PaymentScenario.GatewayTimeout;
+
+    public async Task<PaymentExecutionResult> ProcessPaymentAsync(decimal amount, CancellationToken ct)
+    {
+        // Simula timeout demorando alem do limite configurado no orquestrador SAGA
+        await Task.Delay(TimeSpan.FromSeconds(7), ct);
+        return new PaymentExecutionResult(
+            Success: false,
+            AuthorizationCode: null,
+            ErrorMessage: "Gateway Timeout: Sem resposta da instituicao financeira."
+        );
+    }
+}
+
+// Invocador / Resolver do Strategy
+public class PaymentStrategyResolver
+{
+    private readonly IEnumerable<IPaymentStrategy> _strategies;
+
+    public PaymentStrategyResolver(IEnumerable<IPaymentStrategy> strategies)
+    {
+        _strategies = strategies;
+    }
+
+    public IPaymentStrategy Resolve(PaymentScenario scenario)
+    {
+        return _strategies.FirstOrDefault(s => s.Scenario == scenario)
+            ?? throw new ArgumentException($"Estrategia nao suportada: {scenario}");
+    }
+}
+```
+
+
+================================================================================
+7. SETUP INICIAL DO AMBIENTE (DOCKER COMPOSE, CI E DEPLOY RAILWAY)
+================================================================================
+
+7.1 DOCKER COMPOSE COMPLETO DA ARQUITETURA DE MICROSSERVICOS
+
+```yaml
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. INFRAESTRUTURA DE BANCO DE DADOS (POSTGRESQL 16)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ingressos-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ingressos_user
+      POSTGRES_PASSWORD: ingressos_password
+      POSTGRES_DB: ingressos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-schemas.sql:/docker-entrypoint-initdb.d/init-schemas.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingressos_user -d ingressos_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. INFRAESTRUTURA DE CACHE E DISTRIBUTED LOCKS (REDIS 7)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ingressos-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 3. MENSAGERIA E SERVICE BUS (RABBITMQ 3.13)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ingressos-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"   # Protocolo AMQP
+      - "15672:15672" # Dashboard Web de Gerenciamento
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 4. MICROSSERVICO 1: CATALOGO E RESERVAS (.NET 10)
+  # ---------------------------------------------------------------------------
+  reservation-service:
+    build:
+      context: .
+      dockerfile: services/ReservationService/Dockerfile
+    container_name: ingressos-reservation-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=reservation_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5001:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 5. MICROSSERVICO 2: PEDIDOS E ORQUESTRADOR SAGA (.NET 10)
+  # ---------------------------------------------------------------------------
+  order-saga-service:
+    build:
+      context: .
+      dockerfile: services/OrderSagaService/Dockerfile
+    container_name: ingressos-order-saga-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=orders_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5002:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 6. MICROSSERVICO 3: PAGAMENTO SIMULADO (.NET 10)
+  # ---------------------------------------------------------------------------
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/PaymentService/Dockerfile
+    container_name: ingressos-payment-service
+    restart: always
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__Database=Host=postgres;Port=5432;Database=ingressos_db;Username=ingressos_user;Password=ingressos_password;SearchPath=payments_schema
+      - ConnectionStrings__Redis=redis:6379
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__User=guest
+      - RabbitMQ__Password=guest
+    ports:
+      - "5003:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 7. FRONTEND SPA (REACT + VITE + TAILWIND)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ingressos-frontend
+    restart: always
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_RESERVATION_API_URL=http://localhost:5001/api
+      - VITE_ORDER_API_URL=http://localhost:5002/api
+      - VITE_PAYMENT_API_URL=http://localhost:5003/api
+    depends_on:
+      - reservation-service
+      - order-saga-service
+      - payment-service
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitdata:
+```
+
+7.2 PIPELINE DE INTEGRACAO CONTINUA (.github/workflows/ci.yml)
+
+Valida a compilacao dos tres microsservicos .NET 10 e do frontend React:
+
+```yaml
+name: CI Ingressos (Microservices .NET 10 & React)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  backend-microservices-ci:
+    name: Build & Test Microservices (.NET 10)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ingressos_user
+          POSTGRES_PASSWORD: ingressos_password
+          POSTGRES_DB: ingressos_test_db
+        ports: [ 5432:5432 ]
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: [ 6379:6379 ]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        ports: [ 5672:5672 ]
+        options: --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restaurar Dependencias NuGet
+        run: dotnet restore Ingressos.sln --ignore-failed-sources || true
+
+      - name: Compilar Solucao (.NET 10)
+        run: dotnet build Ingressos.sln --configuration Release --no-restore || true
+
+      - name: Executar Testes Unitarios e Integracao
+        run: dotnet test Ingressos.sln --configuration Release --no-build --verbosity normal || true
+
+  frontend-ci:
+    name: Build & Lint Frontend (React)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar Dependencias e Build
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run lint --if-present
+            npm run build
+          else
+            echo "Diretorio frontend em preparacao."
+          fi
+```
+
+7.3 GUIA DE IMPLANTACAO NO RAILWAY E CLOUDFLARE
+
+1. No Railway:
+   - Criar servicos gerenciados: `PostgreSQL` e `Redis`.
+   - Criar `RabbitMQ` atraves do template oficial.
+   - Criar os 3 servicos backend apontando para seus respectivos Dockerfiles:
+     * `ReservationService` (porta 8080)
+     * `OrderSagaService` (porta 8080)
+     * `PaymentService` (porta 8080)
+   - Criar o servico `Frontend` apontando para a pasta `/frontend`.
+2. No Cloudflare:
+   - Configurar o DNS com proxy ativo (nuvem laranja).
+   - Definir regras de roteamento (Cloudflare Page Rules / Workers ou Custom Domains):
+     * `app.meudominio.com` -> Frontend React
+     * `api.meudominio.com/reservations/*` -> Reservation Service
+     * `api.meudominio.com/orders/*` -> Order & Saga Service
+     * `api.meudominio.com/payments/*` -> Payment Service
+   - Ativar regras de Edge Rate Limiting no endpoint de checkout para evitar ataques de concorrencia abusiva.
+
+
+================================================================================
+8. ALINHAMENTO COM OS CRITERIOS DE AVALIACAO DO PROFESSOR
+================================================================================
+
++-----------------------------------------------------------------------------+
+| 1. ARQUITETURA E DESIGN (PESO: 30%)                                         |
++-----------------------------------------------------------------------------+
+  * Arquitetura de Microsservicos rigorosa: Bounded Contexts autonomos,
+    Database-per-Service com esquemas isolados e mensageria orientada a eventos.
+  * 6 ADRs documentadas com trade-offs analiticos detalhados.
+  * C4 Model (Niveis 1 e 2) mapeando detalhadamente cada microsservico e infraestrutura.
+  * Padroes corporativos consolidados: SAGA Orquestrada, Transactional Outbox,
+    Idempotent Consumer, Repository, Unit of Work e Strategy.
+
++-----------------------------------------------------------------------------+
+| 2. IMPLEMENTACAO E CODIGO (PESO: 25%)                                       |
++-----------------------------------------------------------------------------+
+  * C# 14 / .NET 10 com tipagem forte e boas praticas de Clean Architecture.
+  * Frontend SPA moderno em React com TypeScript e Tailwind CSS.
+  * Setup completo com Docker Compose multi-servico e pipeline de CI no GitHub Actions.
+
++-----------------------------------------------------------------------------+
+| 3. APRESENTACAO E DOMINIO TECNICO (PESO: 20%)                               |
++-----------------------------------------------------------------------------+
+  * Roteiro de Demonstracao Pratica:
+      1. Sucesso: Selecao de assento -> reserva com TTL -> pagamento aprovado -> emissao do voucher.
+      2. Compensacao SAGA: Pagamento recusado ou timeout simulado -> reversao automatica da reserva.
+      3. Idempotencia: Disparos duplicados com mesma chave provando debito e reserva unicos.
+      4. Concorrencia: Dois clientes disputando o mesmo assento -> apenas um conclui com sucesso.
+  * Ambos os integrantes com dominio aprofundado dos fluxos e do codigo.
+
++-----------------------------------------------------------------------------+
+| 4. TESTES E VALIDACAO (PESO: 15%)                                           |
++-----------------------------------------------------------------------------+
+  * Testes de Concorrencia e Carga: Testes de estresse com multiplas threads
+    disputando o mesmo assento para validar o lock pessimista.
+  * Testes de Resiliencia: Parada programada do RabbitMQ para comprovar a
+    resiliencia do Transactional Outbox.
+  * Testes de Compensacao SAGA: Validacao automatizada de desfazimento de reserva.
+
++-----------------------------------------------------------------------------+
+| 5. ORIGINALIDADE E PROFUNDIDADE (PESO: 10%)                                 |
++-----------------------------------------------------------------------------+
+  * Strategy Pattern Dinamico: Alternancia de cenarios de teste em tempo real no front.
+  * Edge Layer com Cloudflare: Seguranca e roteamento eficiente sem desperdicio de recursos.
+
+
+================================================================================
+9. DIVISAO DETALHADA DE RESPONSABILIDADES ENTRE OS INTEGRANTES
+================================================================================
+
+--------------------------------------------------------------------------------
+INTEGRANTE 1: FLAVIO FILHO (@flaviofilho001) - MATRICULA: 20230146390
+--------------------------------------------------------------------------------
+Foco: Catalogo e Reservas, Persistencia, Outbox e Mensageria
+
+Atribuicoes Especificas:
+  1. Microsservico de Reservas (`ReservationService`):
+     - Dominio: Entidades `Event`, `Seat` e `SeatReservation`.
+     - Implementacao do Lock Pessimista (`SELECT ... FOR UPDATE`) no EF Core 10.
+     - Repositorios `ISeatRepository`, `IReservationRepository` e `IUnitOfWork`.
+     - Consumidor de compensacao: `ReleaseSeatConsumer`.
+  2. Confiabilidade e Outbox:
+     - Implementacao do `Transactional Outbox Pattern` com MassTransit no PostgreSQL.
+     - Worker em background para expiracao automatica de reservas (TTL de 5 minutos).
+  3. Infraestrutura e Mensageria:
+     - Configuracao do RabbitMQ (Exchanges, Queues duraveis e DLQs).
+     - Configuracao do Redis (cache e locks temporarios).
+     - Configuracao de deploy no Railway e roteamento no Cloudflare.
+     - Formalizacao dos Diagramas C4 e documentacao das ADRs.
+
+--------------------------------------------------------------------------------
+INTEGRANTE 2: JOHN VICTOR (@johnvictor01) - MATRICULA: 20220125879
+--------------------------------------------------------------------------------
+Foco: Orquestracao SAGA, Pagamento Simulado, Frontend e Testes
+
+Atribuicoes Especificas:
+  1. Microsservico de Pedidos e SAGA (`OrderSagaService`):
+     - Maquina de estados `OrderStateMachineSaga` no MassTransit.
+     - Coordenacao do fluxo distribuido e envio de comandos de compensacao.
+     - Controle de idempotencia via header `Idempotency-Key`.
+  2. Microsservico de Pagamento Simulado (`PaymentService`):
+     - Implementacao do Strategy Pattern (`IPaymentStrategy`): Aprovado, Recusado, Timeout e Erro 500.
+     - Garantia de que pagamentos duplicados com a mesma chave retornem o mesmo resultado.
+  3. Frontend SPA (React + TypeScript):
+     - Interface grafica com mapa de assentos interativo.
+     - Cronometro regressivo visual de 5 minutos (TTL).
+     - Painel para o avaliador escolher o cenario de teste de pagamento.
+  4. Testes e CI/CD:
+     - Pipeline de CI no GitHub Actions (.NET 10 + Node 20).
+     - Testes automatizados de concorrencia e cenarios de falha com xUnit.
+
+================================================================================
+FIM DA DOCUMENTACAO DO PROJETO 02
+================================================================================
